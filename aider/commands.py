@@ -1,29 +1,28 @@
+import json
 import os
-from rich.text import Text
-from rich.prompt import Confirm
+import shlex
+import subprocess
+import sys
+
+import git
+import tiktoken
 from prompt_toolkit.completion import Completion
-from aider import prompts
+
+from aider import prompts, utils
 
 
 class Commands:
     def __init__(self, io, coder):
         self.io = io
         self.coder = coder
+        self.tokenizer = tiktoken.encoding_for_model(coder.main_model.name)
 
-    def help(self):
-        "Show help about all commands"
-        commands = self.get_commands()
-        for cmd in commands:
-            cmd_method_name = f"cmd_{cmd[1:]}"
-            cmd_method = getattr(self, cmd_method_name, None)
-            if cmd_method:
-                description = cmd_method.__doc__
-                self.io.tool(f"{cmd} {description}")
-            else:
-                self.io.tool(f"{cmd} No description available.")
+    def is_command(self, inp):
+        if inp[0] == "/":
+            return True
 
     def get_commands(self):
-        commands = ["/help"]
+        commands = []
         for attr in dir(self):
             if attr.startswith("cmd_"):
                 commands.append("/" + attr[4:])
@@ -43,7 +42,7 @@ class Commands:
         if cmd_method:
             return cmd_method(args)
         else:
-            self.io.tool(f"Error: Command {cmd_name} not found.")
+            self.io.tool_output(f"Error: Command {cmd_name} not found.")
 
     def run(self, inp):
         words = inp.strip().split()
@@ -56,17 +55,17 @@ class Commands:
         all_commands = self.get_commands()
         matching_commands = [cmd for cmd in all_commands if cmd.startswith(first_word)]
         if len(matching_commands) == 1:
-            if matching_commands[0] == "/help":
-                self.help()
-            else:
-                return self.do_run(matching_commands[0][1:], rest_inp)
+            return self.do_run(matching_commands[0][1:], rest_inp)
         elif len(matching_commands) > 1:
-            self.io.tool_error("Ambiguous command: ', '.join(matching_commands)}")
+            self.io.tool_error(f"Ambiguous command: {', '.join(matching_commands)}")
         else:
             self.io.tool_error(f"Error: {first_word} is not a valid command.")
 
+    # any method called cmd_xxx becomes a command automatically.
+    # each one must take an args param.
+
     def cmd_commit(self, args):
-        "Commit edits to chat session files made outside the chat (commit message optional)"
+        "Commit edits to the repo made outside the chat (commit message optional)"
 
         if not self.coder.repo:
             self.io.tool_error("No git repository found.")
@@ -79,6 +78,75 @@ class Commands:
         commit_message = args.strip()
         self.coder.commit(message=commit_message, which="repo_files")
 
+    def cmd_clear(self, args):
+        "Clear the chat history"
+
+        self.coder.done_messages = []
+        self.coder.cur_messages = []
+
+    def cmd_tokens(self, args):
+        "Report on the number of tokens used by the current chat context"
+
+        res = []
+
+        # system messages
+        msgs = [
+            dict(role="system", content=self.coder.gpt_prompts.main_system),
+            dict(role="system", content=self.coder.gpt_prompts.system_reminder),
+        ]
+        tokens = len(self.tokenizer.encode(json.dumps(msgs)))
+        res.append((tokens, "system messages", ""))
+
+        # chat history
+        msgs = self.coder.done_messages + self.coder.cur_messages
+        if msgs:
+            msgs = [dict(role="dummy", content=msg) for msg in msgs]
+            msgs = json.dumps(msgs)
+            tokens = len(self.tokenizer.encode(msgs))
+            res.append((tokens, "chat history", "use /clear to clear"))
+
+        # repo map
+        other_files = set(self.coder.get_all_abs_files()) - set(self.coder.abs_fnames)
+        if self.coder.repo_map:
+            repo_content = self.coder.repo_map.get_repo_map(self.coder.abs_fnames, other_files)
+            if repo_content:
+                tokens = len(self.tokenizer.encode(repo_content))
+                res.append((tokens, "repository map", "use --map-tokens to resize"))
+
+        # files
+        for fname in self.coder.abs_fnames:
+            relative_fname = self.coder.get_rel_fname(fname)
+            quoted = utils.quoted_file(fname, relative_fname)
+            tokens = len(self.tokenizer.encode(quoted))
+            res.append((tokens, f"{relative_fname}", "use /drop to drop from chat"))
+
+        self.io.tool_output("Approximate context window usage, in tokens:")
+        self.io.tool_output()
+
+        width = 8
+
+        def fmt(v):
+            return format(int(v), ",").rjust(width)
+
+        col_width = max(len(row[1]) for row in res)
+
+        total = 0
+        for tk, msg, tip in res:
+            total += tk
+            msg = msg.ljust(col_width)
+            self.io.tool_output(f"{fmt(tk)} {msg} {tip}")
+
+        self.io.tool_output("=" * width)
+        self.io.tool_output(f"{fmt(total)} tokens total")
+
+        limit = self.coder.main_model.max_context_tokens
+        remaining = limit - total
+        if remaining > 0:
+            self.io.tool_output(f"{fmt(remaining)} tokens remaining in context window")
+        else:
+            self.io.tool_error(f"{fmt(remaining)} tokens remaining, window exhausted!")
+        self.io.tool_output(f"{fmt(limit)} tokens max context window size")
+
     def cmd_undo(self, args):
         "Undo the last git commit if it was done by aider"
         if not self.coder.repo:
@@ -86,21 +154,26 @@ class Commands:
             return
 
         if self.coder.repo.is_dirty():
-            self.io.tool_error("The repository has uncommitted changes. Please commit or stash them before undoing.")
+            self.io.tool_error(
+                "The repository has uncommitted changes. Please commit or stash them before"
+                " undoing."
+            )
             return
 
         local_head = self.coder.repo.git.rev_parse("HEAD")
-        has_origin = any(remote.name == "origin" for remote in self.coder.repo.remotes)
+        current_branch = self.coder.repo.active_branch.name
+        try:
+            remote_head = self.coder.repo.git.rev_parse(f"origin/{current_branch}")
+            has_origin = True
+        except git.exc.GitCommandError:
+            has_origin = False
 
         if has_origin:
-            current_branch = self.coder.repo.active_branch.name
-            try:
-                remote_head = self.coder.repo.git.rev_parse(f"origin/{current_branch}")
-            except git.exc.GitCommandError:
-                self.io.tool_error(f"Error: Unable to get the remote 'origin/{current_branch}'.")
-                return
             if local_head == remote_head:
-                self.io.tool_error("The last commit has already been pushed to the origin. Undoing is not possible.")
+                self.io.tool_error(
+                    "The last commit has already been pushed to the origin. Undoing is not"
+                    " possible."
+                )
                 return
 
         last_commit = self.coder.repo.head.commit
@@ -111,13 +184,14 @@ class Commands:
             self.io.tool_error("The last commit was not made by aider in this chat session.")
             return
         self.coder.repo.git.reset("--hard", "HEAD~1")
-        self.io.tool(
+        self.io.tool_output(
             f"{last_commit.message.strip()}\n"
             f"The above commit {self.coder.last_aider_commit_hash} "
             "was reset and removed from git.\n"
         )
 
-        return prompts.undo_command_reply
+        if self.coder.main_model.send_undo_reply:
+            return prompts.undo_command_reply
 
     def cmd_diff(self, args):
         "Display the diff of the last aider commit"
@@ -132,7 +206,7 @@ class Commands:
         commits = f"{self.coder.last_aider_commit_hash}~1"
         diff = self.coder.get_diffs(commits, self.coder.last_aider_commit_hash)
 
-        # don't use io.tool() because we don't want to log or further colorize
+        # don't use io.tool_output() because we don't want to log or further colorize
         print(diff)
 
     def completions_add(self, partial):
@@ -150,35 +224,38 @@ class Commands:
         for word in args.split():
             matched_files = [file for file in files if word in file]
 
-        if not matched_files:
-            if self.coder.repo is not None:
-                create_file = Confirm.ask(
-                    f"No files matched '{word}'. Do you want to create the file and add it to git?",
-                )
-            else:
-                create_file = Confirm.ask(
-                    f"No files matched '{word}'. Do you want to create the file?"
-                )
-
-            if create_file:
-                with open(os.path.join(self.coder.root, word), "w"):
-                    pass
-                matched_files = [word]
+            if not matched_files:
                 if self.coder.repo is not None:
-                    self.coder.repo.git.add(os.path.join(self.coder.root, word))
-                    commit_message = f"aider: Created and added {word} to git."
-                    self.coder.repo.git.commit("-m", commit_message, "--no-verify")
-            else:
-                self.io.tool_error(f"No files matched '{word}'")
+                    create_file = self.io.confirm_ask(
+                        (
+                            f"No files matched '{word}'. Do you want to create the file and add it"
+                            " to git?"
+                        ),
+                    )
+                else:
+                    create_file = self.io.confirm_ask(
+                        f"No files matched '{word}'. Do you want to create the file?"
+                    )
 
-        for matched_file in matched_files:
-            abs_file_path = os.path.abspath(os.path.join(self.coder.root, matched_file))
-            if abs_file_path not in self.coder.abs_fnames:
-                self.coder.abs_fnames.add(abs_file_path)
-                self.io.tool(f"Added {matched_file} to the chat")
-                added_fnames.append(matched_file)
-            else:
-                self.io.tool_error(f"{matched_file} is already in the chat")
+                if create_file:
+                    with open(os.path.join(self.coder.root, word), "w"):
+                        pass
+                    matched_files = [word]
+                    if self.coder.repo is not None:
+                        self.coder.repo.git.add(os.path.join(self.coder.root, word))
+                        commit_message = f"aider: Created and added {word} to git."
+                        self.coder.repo.git.commit("-m", commit_message, "--no-verify")
+                else:
+                    self.io.tool_error(f"No files matched '{word}'")
+
+            for matched_file in matched_files:
+                abs_file_path = os.path.abspath(os.path.join(self.coder.root, matched_file))
+                if abs_file_path not in self.coder.abs_fnames:
+                    self.coder.abs_fnames.add(abs_file_path)
+                    self.io.tool_output(f"Added {matched_file} to the chat")
+                    added_fnames.append(matched_file)
+                else:
+                    self.io.tool_error(f"{matched_file} is already in the chat")
 
         if not added_fnames:
             return
@@ -200,6 +277,10 @@ class Commands:
     def cmd_drop(self, args):
         "Remove matching files from the chat session"
 
+        if not args.strip():
+            self.io.tool_output("Dropping all files from the chat session.")
+            self.coder.abs_fnames = set()
+
         for word in args.split():
             matched_files = [
                 file
@@ -212,7 +293,34 @@ class Commands:
             for matched_file in matched_files:
                 relative_fname = os.path.relpath(matched_file, self.coder.root)
                 self.coder.abs_fnames.remove(matched_file)
-                self.io.tool(f"Removed {relative_fname} from the chat")
+                self.io.tool_output(f"Removed {relative_fname} from the chat")
+
+    def cmd_run(self, args):
+        "Run a shell command and optionally add the output to the chat"
+        try:
+            parsed_args = shlex.split(args)
+            result = subprocess.run(
+                parsed_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            combined_output = result.stdout
+        except Exception as e:
+            self.io.tool_error(f"Error running command: {e}")
+
+        self.io.tool_output(combined_output)
+
+        if self.io.confirm_ask("Add the output to the chat?", default="y"):
+            for line in combined_output.splitlines():
+                self.io.tool_output(line, log_only=True)
+
+            msg = prompts.run_output.format(
+                command=args,
+                output=combined_output,
+            )
+            return msg
+
+    def cmd_exit(self, args):
+        "Exit the application"
+        sys.exit()
 
     def cmd_ls(self, args):
         "List all known files and those included in the chat session"
@@ -229,11 +337,23 @@ class Commands:
                 other_files.append(file)
 
         if chat_files:
-            self.io.tool("Files in chat:\n")
+            self.io.tool_output("Files in chat:\n")
         for file in chat_files:
-            self.io.tool(f"  {file}")
+            self.io.tool_output(f"  {file}")
 
         if other_files:
-            self.io.tool("\nRepo files not in the chat:\n")
+            self.io.tool_output("\nRepo files not in the chat:\n")
         for file in other_files:
-            self.io.tool(f"  {file}")
+            self.io.tool_output(f"  {file}")
+
+    def cmd_help(self, args):
+        "Show help about all commands"
+        commands = sorted(self.get_commands())
+        for cmd in commands:
+            cmd_method_name = f"cmd_{cmd[1:]}"
+            cmd_method = getattr(self, cmd_method_name, None)
+            if cmd_method:
+                description = cmd_method.__doc__
+                self.io.tool_output(f"{cmd} {description}")
+            else:
+                self.io.tool_output(f"{cmd} No description available.")
